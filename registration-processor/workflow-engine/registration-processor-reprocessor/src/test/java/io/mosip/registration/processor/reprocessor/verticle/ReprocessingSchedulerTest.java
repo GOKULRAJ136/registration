@@ -35,6 +35,15 @@ import io.vertx.core.eventbus.Message;
 import io.vertx.core.eventbus.MessageCodec;
 import io.vertx.core.eventbus.MessageConsumer;
 import io.vertx.core.eventbus.MessageProducer;
+import org.springframework.test.util.ReflectionTestUtils;
+
+import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.Mockito.doNothing;
+import static org.mockito.Mockito.when;
+
+import java.lang.reflect.Field;
+import java.util.ArrayList;
+import java.util.List;
 
 /**
  * Test class for scheduler
@@ -56,13 +65,19 @@ public class ReprocessingSchedulerTest {
 	 * Mocked Vertx Async Handler
 	 */
 	@Mock
-	AsyncResult<String> res;
+	private AsyncResult<String> res;
 
 	/**
 	 * Mocked Spring Environment
 	 */
 	@Mock
-	Environment env;
+	private Environment env;
+
+	@Mock
+	private MosipEventBus mosipEventBus;
+
+	@Mock
+	private EventBus eventBus;
 
 	private Logger fooLogger;
 
@@ -72,10 +87,33 @@ public class ReprocessingSchedulerTest {
 	 * Setup for test
 	 */
 	@Before
-	public void setup() {
+	public void setup() throws NoSuchFieldException, IllegalAccessException {
 		fooLogger = (Logger) LoggerFactory.getLogger(ReprocessorVerticle.class);
 		listAppender = new ListAppender<>();
-		Mockito.when(vertx.eventBus()).thenReturn(Vertx.vertx().eventBus());
+		listAppender.start();
+		fooLogger.addAppender(listAppender);
+
+		// Mock Vertx and EventBus
+		// when(vertx.eventBus()).thenReturn(eventBus);
+		// when(mosipEventBus.getEventbus()).thenReturn(vertx);
+		// Mockito.doReturn(mosipEventBus).when(reprocessorVerticle).getEventBus(any(), any());
+
+		// Mock Environment properties for cronScheduling
+		// when(env.getProperty(any())).thenReturn("*"); // Mock cron properties
+
+		// Set cacheTargetSize and other fields via reflection
+		ReflectionTestUtils.setField(reprocessorVerticle, "cacheTargetSize", 200);
+		ReflectionTestUtils.setField(reprocessorVerticle, "fetchSize", 100);
+		ReflectionTestUtils.setField(reprocessorVerticle, "prefetchMultiplier", 1);
+		ReflectionTestUtils.setField(reprocessorVerticle, "elapseTime", 3600000L);
+		ReflectionTestUtils.setField(reprocessorVerticle, "reprocessCount", 3);
+		ReflectionTestUtils.setField(reprocessorVerticle, "reprocessExcludeStageNames", new ArrayList<>(List.of("PacketReceiverStage")));
+		ReflectionTestUtils.setField(reprocessorVerticle, "reprocessRestartFromStage", "validationStage");
+		ReflectionTestUtils.setField(reprocessorVerticle, "reprocessRestartTriggerFilter", new ArrayList<>(List.of("validationStage:SUCCESS")));
+		ReflectionTestUtils.setField(reprocessorVerticle, "environment", env);
+
+		// Initialize packetCache after setting cacheTargetSize
+		reprocessorVerticle.init();
 	}
 
 	/**
@@ -133,9 +171,14 @@ public class ReprocessingSchedulerTest {
 	 * Success Test for deployment of ReprocessorVerticle
 	 */
 	@Test
-	public void testDeploySuccess() {
+	public void testDeploySuccess() throws NoSuchFieldException, IllegalAccessException {
 		reprocessorVerticle.deployVerticle();
-		assertNotNull(reprocessorVerticle.mosipEventBus);
+		// Use reflection to access private field
+		Field field = ReprocessorVerticle.class.getDeclaredField("mosipEventBus");
+		field.setAccessible(true);
+		MosipEventBus eventBus = (MosipEventBus) field.get(reprocessorVerticle);
+
+		assertNotNull(eventBus);
 	}
 
 	/**
