@@ -43,7 +43,6 @@ public class ReprocessorApplication {
 				"io.mosip.registration.processor.core.kernel.beans",
 				"io.mosip.registration.processor.packet.storage.config");
 		ctx.refresh();
-
 		ReprocessorVerticle reprocessorVerticle = ctx.getBean(ReprocessorVerticle.class);
 		reprocessorVerticle.deployVerticle();
 	}
