@@ -765,6 +765,30 @@ public class RegistrationStatusServiceImpl
 		}
 	}
 
+	@Override
+	public List<RegistrationStatusEntity> getUnProcessedPackets1(Integer fetchSize, long elapseTime,
+																Integer reprocessCount, List<String> status, List<String> excludeStageNames) {
+
+		regProcLogger.debug(LoggerFileConstant.SESSIONID.toString(), LoggerFileConstant.USERID.toString(), "",
+				"RegistrationStatusServiceImpl::getReprocessPacket()::entry");
+		try {
+			List<RegistrationStatusEntity> entityList = registrationStatusDao.getUnProcessedPackets(fetchSize,
+					elapseTime, reprocessCount, status, excludeStageNames);
+
+			regProcLogger.debug(LoggerFileConstant.SESSIONID.toString(), LoggerFileConstant.USERID.toString(), "",
+					"RegistrationStatusServiceImpl::getReprocessPacket()::exit");
+
+			//return convertEntityListToDtoList(entityList);
+			return entityList;
+		} catch (DataAccessException | DataAccessLayerException e) {
+
+			regProcLogger.error(LoggerFileConstant.SESSIONID.toString(), LoggerFileConstant.REGISTRATIONID.toString(),
+					"", e.getMessage() + ExceptionUtils.getStackTrace(e));
+			throw new TablenotAccessibleException(
+					PlatformErrorMessages.RPR_RGS_REGISTRATION_TABLE_NOT_ACCESSIBLE.getMessage(), e);
+		}
+	}
+
 	/*
 	 * (non-Javadoc)
 	 * 
@@ -858,7 +882,7 @@ public class RegistrationStatusServiceImpl
 	}
 
 	@Override
-	public List<InternalRegistrationStatusDto> getResumablePackets(Integer fetchSize) {
+	public List<InternalRegistrationStatusDto> getResumablePacketsOld(Integer fetchSize) {
 		regProcLogger.debug(LoggerFileConstant.SESSIONID.toString(), LoggerFileConstant.USERID.toString(), "",
 				"RegistrationStatusServiceImpl::getResumablePackets()::entry");
 		try {
@@ -869,6 +893,27 @@ public class RegistrationStatusServiceImpl
 
 			return convertEntityListToDtoList(entityList);
 
+		} catch (DataAccessException | DataAccessLayerException e) {
+
+			regProcLogger.error(LoggerFileConstant.SESSIONID.toString(), LoggerFileConstant.REGISTRATIONID.toString(),
+					"", e.getMessage() + ExceptionUtils.getStackTrace(e));
+			throw new TablenotAccessibleException(
+					PlatformErrorMessages.RPR_RGS_REGISTRATION_TABLE_NOT_ACCESSIBLE.getMessage(), e);
+		}
+	}
+
+	@Override
+	public List<RegistrationStatusEntity> getResumablePackets(Integer fetchSize) {
+		regProcLogger.debug(LoggerFileConstant.SESSIONID.toString(), LoggerFileConstant.USERID.toString(), "",
+				"RegistrationStatusServiceImpl::getResumablePackets()::entry");
+		try {
+			List<RegistrationStatusEntity> entityList = registrationStatusDao.getResumablePackets(fetchSize);
+
+			regProcLogger.debug(LoggerFileConstant.SESSIONID.toString(), LoggerFileConstant.USERID.toString(), "",
+					"RegistrationStatusServiceImpl::getResumablePackets()::exit");
+
+			//return convertEntityListToDtoList(entityList);
+			return entityList;
 		} catch (DataAccessException | DataAccessLayerException e) {
 
 			regProcLogger.error(LoggerFileConstant.SESSIONID.toString(), LoggerFileConstant.REGISTRATIONID.toString(),
@@ -968,6 +1013,20 @@ public class RegistrationStatusServiceImpl
 
 		auditLogRequestBuilder.createAuditRequestBuilder(description.getMessage(), eventId, eventName, eventType,
 				moduleId, moduleName, registrationStatusDto.getRegistrationId());
+	}
+
+	@Override
+	public void updateRegistrationStatusForWorkflowEngineBatch(List<InternalRegistrationStatusDto> dtos, String moduleId, String moduleName) {
+		for (InternalRegistrationStatusDto dto : dtos) {
+			updateRegistrationStatusForWorkflowEngine(dto, moduleId, moduleName);
+		}
+	}
+
+	@Override
+	public List<RegistrationStatusEntity> getUnProcessedPacketsByType(Integer fetchSize, long elapseTime,
+																	  Integer reprocessCount, List<String> status, List<String> excludeStageNames, List<String> registrationTypes) {
+		return registrationStatusDao.getUnProcessedPacketsByType(fetchSize, elapseTime, reprocessCount,
+				status, excludeStageNames, registrationTypes);
 	}
 	
 }

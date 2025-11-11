@@ -2,6 +2,7 @@ package io.mosip.registration.processor.status.service;
 
 import java.util.List;
 
+import io.mosip.registration.processor.status.entity.RegistrationStatusEntity;
 import org.springframework.data.domain.Page;
 import org.springframework.stereotype.Service;
 
@@ -122,6 +123,9 @@ public interface RegistrationStatusService<T, U, D> {
 	public List<U> getUnProcessedPackets(Integer fetchSize, long elapseTime, Integer reprocessCount,
 			List<String> status, List<String> excludeStageNames);
 
+	public List<RegistrationStatusEntity> getUnProcessedPackets1(Integer fetchSize, long elapseTime, Integer reprocessCount,
+																List<String> status, List<String> excludeStageNames);
+
 	/**
 	 * Gets the un processed packets count.
 	 *
@@ -162,6 +166,13 @@ public interface RegistrationStatusService<T, U, D> {
 
 	public void updateRegistrationStatusForWorkflow(U registrationStatusDto, String moduleId, String moduleName);
 
-	public List<InternalRegistrationStatusDto> getResumablePackets(Integer fetchSize);
+	public List<InternalRegistrationStatusDto> getResumablePacketsOld(Integer fetchSize);
+
+	public List<RegistrationStatusEntity> getResumablePackets(Integer fetchSize);
+
+	void updateRegistrationStatusForWorkflowEngineBatch(List<U> dtos, String moduleId, String moduleName);
+
+	public List<RegistrationStatusEntity> getUnProcessedPacketsByType(Integer fetchSize, long elapseTime, Integer reprocessCount,
+																	  List<String> status, List<String> excludeStageNames, List<String> registrationTypes);
 
 }

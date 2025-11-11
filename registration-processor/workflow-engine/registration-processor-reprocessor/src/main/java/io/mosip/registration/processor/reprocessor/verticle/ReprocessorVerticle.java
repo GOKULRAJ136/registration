@@ -1,15 +1,19 @@
 package io.mosip.registration.processor.reprocessor.verticle;
 
-import java.util.ArrayList;
-import java.util.HashMap;
-import java.util.HashSet;
-import java.util.List;
-import java.util.Map;
-import java.util.Set;
+import java.util.*;
+import java.util.concurrent.ArrayBlockingQueue;
 import java.util.concurrent.BlockingQueue;
-import java.util.concurrent.LinkedBlockingQueue;
+import java.util.concurrent.CompletableFuture;
+import java.util.stream.Collectors;
 
+import com.fasterxml.jackson.core.type.TypeReference;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import io.mosip.registration.processor.reprocessor.config.AllocationConfig;
+import io.mosip.registration.processor.status.dto.SyncTypeDto;
+import io.mosip.registration.processor.status.entity.RegistrationStatusEntity;
+import io.vertx.core.Promise;
 import jakarta.annotation.PostConstruct;
+import jakarta.annotation.PreDestroy;
 import org.apache.commons.lang3.exception.ExceptionUtils;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.annotation.Value;
@@ -86,7 +90,6 @@ public class ReprocessorVerticle extends MosipVerticleAPIManager {
 
 	private static final Logger LOGGER = RegProcessorLogger.getLogger(ReprocessorVerticle.class);
 
-
 	private static final String VERTICLE_PROPERTY_PREFIX = "mosip.regproc.reprocessor.";
 
 	/**
@@ -109,7 +112,7 @@ public class ReprocessorVerticle extends MosipVerticleAPIManager {
 	/**
 	 * The number of packets to fetch and process per reprocessing cycle.
 	 */
-	@Value("${registration.processor.reprocess.fetchsize:200}")
+	@Value("${registration.processor.reprocess.fetchsize:10}")
 	private Integer fetchSize;
 
 	/**
@@ -161,7 +164,27 @@ public class ReprocessorVerticle extends MosipVerticleAPIManager {
 	 * The in-memory cache for prefetching eligible packets to reduce DB query frequency.
 	 * Implemented as a thread-safe queue with a capacity limit to prevent memory overflow.
 	 */
-	private BlockingQueue<InternalRegistrationStatusDto> packetCache; // Adjustable capacity
+	private BlockingQueue<InternalRegistrationStatusDto> packetCache = new ArrayBlockingQueue<>(Math.min(cacheTargetSize * 2, 10000)) {
+		@Override
+		public boolean offer(InternalRegistrationStatusDto dto) {
+			boolean added = super.offer(dto);
+			if (added) {
+				cacheRegistrationIds.add(dto.getRegistrationId());
+			}
+			return added;
+		}
+
+		@Override
+		public int drainTo(Collection<? super InternalRegistrationStatusDto> c, int maxElements) {
+			List<InternalRegistrationStatusDto> tempList = new ArrayList<>();
+			int drained = super.drainTo(tempList, maxElements);
+			if (drained > 0) {
+				c.addAll(tempList);
+				tempList.forEach(dto -> cacheRegistrationIds.remove(dto.getRegistrationId()));
+			}
+			return drained;
+		}
+	};
 
 	/**
 	 * Flag indicating if the last transaction was successful.
@@ -192,12 +215,76 @@ public class ReprocessorVerticle extends MosipVerticleAPIManager {
 	@Value("${server.port}")
 	private String port;
 
+	@Value("${registration.processor.reprocess.allocation.config:[]}")
+	private String allocationConfigJson;
+
+	private List<AllocationConfig> allocationConfigs;
+
+	private Set<String> cacheRegistrationIds = Collections.synchronizedSet(new HashSet<>());
+
 	/**
 	 * Initializes the cache after dependencies are injected.
 	 */
 	@PostConstruct
 	public void init() {
-		this.packetCache = new LinkedBlockingQueue<>(cacheTargetSize * 2);
+		this.cacheRegistrationIds = Collections.synchronizedSet(new HashSet<>());
+		// Parse the JSON configuration
+		ObjectMapper mapper = new ObjectMapper();
+		try {
+			allocationConfigs = mapper.readValue(allocationConfigJson,
+					new TypeReference<List<AllocationConfig>>(){});
+			LOGGER.info("Loaded allocation configuration: {}", allocationConfigs);
+		} catch (Exception e) {
+			LOGGER.error("Failed to parse allocation config: {}", e.getMessage());
+			allocationConfigs = new ArrayList<>();
+		}
+	}
+
+	/**
+	 * Cleans up resources and marks in-progress packets as failed before destruction.
+	 * This method is called by the Spring container during application shutdown.
+	 */
+	@PreDestroy
+	public void shutdown() {
+		LOGGER.warn("ReprocessorVerticle::shutdown::Marking cached in-progress packets as failed");
+		List<InternalRegistrationStatusDto> cachedPackets = new ArrayList<>();
+		packetCache.drainTo(cachedPackets, Integer.MAX_VALUE); // Drain all packets from cache
+
+		if (!cachedPackets.isEmpty()) {
+			List<InternalRegistrationStatusDto> batch = new ArrayList<>();
+			cachedPackets.forEach(dto -> {
+				try {
+					dto.setStatusCode(RegistrationStatusCode.FAILED.toString());
+					dto.setStatusComment("Reprocessor pod shutdown - processing interrupted");
+					dto.setLatestTransactionStatusCode(RegistrationTransactionStatusCode.FAILED.toString());
+					batch.add(dto);
+					cacheRegistrationIds.remove(dto.getRegistrationId()); // Remove from cache tracking
+					LOGGER.info("Marked cached packet {} as FAILED on shutdown", dto.getRegistrationId());
+				} catch (Exception e) {
+					LOGGER.error("Failed to mark cached packet {} as FAILED on shutdown: {}",
+							dto.getRegistrationId(), e.getMessage());
+				}
+			});
+
+			if (!batch.isEmpty()) {
+				vertx.executeBlocking(promise -> {
+					try {
+						registrationStatusService.updateRegistrationStatusForWorkflowEngineBatch(batch,
+								"RPR_SHUTDOWN", ModuleName.RE_PROCESSOR.toString());
+						promise.complete();
+					} catch (Exception e) {
+						promise.fail(e);
+					}
+				}, res -> {
+					if (res.failed()) {
+						LOGGER.error("Failed to update batch on shutdown: {}", res.cause().getMessage());
+					}
+				});
+				LOGGER.info("Shutdown complete - marked {} cached packets as failed", batch.size());
+			}
+		} else {
+			LOGGER.warn("No cached packets found during shutdown");
+		}
 	}
 
 	/**
@@ -306,50 +393,161 @@ public class ReprocessorVerticle extends MosipVerticleAPIManager {
 	public MessageDTO process(MessageDTO object) {
 		List<InternalRegistrationStatusDto> reprocessorDtoList = new ArrayList<>();
 		LogDescription description = new LogDescription();
-		List<String> statusList = new ArrayList<>();
-		statusList.add(RegistrationTransactionStatusCode.SUCCESS.toString());
-		statusList.add(RegistrationTransactionStatusCode.REPROCESS.toString());
-		statusList.add(RegistrationTransactionStatusCode.IN_PROGRESS.toString());
-		LOGGER.debug(LoggerFileConstant.SESSIONID.toString(), LoggerFileConstant.REGISTRATIONID.toString(), "", "ReprocessorVerticle::process()::entry");
+		List<String> statusList = List.of(RegistrationTransactionStatusCode.SUCCESS.toString(),
+				RegistrationTransactionStatusCode.REPROCESS.toString(),
+				RegistrationTransactionStatusCode.IN_PROGRESS.toString());
+		LOGGER.debug(LoggerFileConstant.SESSIONID.toString(), LoggerFileConstant.REGISTRATIONID.toString(), "",
+				"ReprocessorVerticle::process()::entry");
 
-		StringBuffer ridSb = new StringBuffer();
+		StringBuilder ridSb = new StringBuilder();
+		isTransactionSuccessful = true;
+		Set<String> seenRegistrationIds = new HashSet<>(); // Track unique regIds
+
 		try {
 			Map<String, Set<String>> reprocessRestartTriggerMap = initializeReprocessRestartTriggerMapping();
 
 			// Step 1: Drain from cache first (up to fetchSize)
 			int drained = packetCache.drainTo(reprocessorDtoList, fetchSize);
+			seenRegistrationIds.addAll(reprocessorDtoList.stream()
+					.map(InternalRegistrationStatusDto::getRegistrationId)
+					.collect(Collectors.toSet()));
 			int remainingToFetch = fetchSize - drained;
 
-			// Step 2: If cache didn't fulfill, query DB for more (including prefetch)
+			// Step 2: If cache didn't fulfill, query DB based on allocation config
 			if (remainingToFetch > 0) {
-				int querySize = remainingToFetch + (fetchSize * prefetchMultiplier);
-				List<InternalRegistrationStatusDto> fetchedFromDb = registrationStatusService.getResumablePackets(querySize);
-				if (!CollectionUtils.isEmpty(fetchedFromDb)) {
-					if (fetchedFromDb.size() < querySize) {
-						List<InternalRegistrationStatusDto> unprocessed = registrationStatusService.getUnProcessedPackets(
-								querySize - fetchedFromDb.size(), elapseTime, reprocessCount, statusList, reprocessExcludeStageNames);
-						if (!CollectionUtils.isEmpty(unprocessed)) {
-							fetchedFromDb.addAll(unprocessed);
+				List<RegistrationStatusEntity> fetchedFromDb = new ArrayList<>();
+				int totalFetched = 0;
+
+				// Precompute allocation sizes
+				Map<AllocationConfig, Integer> allocationSizes = allocationConfigs.stream()
+						.collect(Collectors.toMap(
+								config -> config,
+								config -> (int) Math.ceil((remainingToFetch * config.getPercentageAllocation()) / 100.0),
+								(v1, v2) -> v1,
+								LinkedHashMap::new));
+
+				// Batch fetch for all configs
+				List<CompletableFuture<List<RegistrationStatusEntity>>> futures = new ArrayList<>();
+				for (Map.Entry<AllocationConfig, Integer> entry : allocationSizes.entrySet()) {
+					AllocationConfig config = entry.getKey();
+					int allocationSize = entry.getValue();
+					if (allocationSize == 0) continue;
+
+					CompletableFuture<List<RegistrationStatusEntity>> future = new CompletableFuture<>();
+					vertx.executeBlocking(promise -> {
+						List<RegistrationStatusEntity> result = new ArrayList<>();
+
+						// Fetch resumable packets
+						List<RegistrationStatusEntity> resumable = registrationStatusService.getResumablePackets(allocationSize);
+						int fetchedResumable = CollectionUtils.isEmpty(resumable) ? 0 : resumable.size();
+						synchronized (seenRegistrationIds) {
+							result.addAll(resumable.stream()
+									.filter(entity -> !seenRegistrationIds.contains(entity.getRegId()) &&
+											!cacheRegistrationIds.contains(entity.getRegId()))
+									.collect(Collectors.toList()));
+							seenRegistrationIds.addAll(result.stream()
+									.map(RegistrationStatusEntity::getRegId)
+									.collect(Collectors.toSet()));
 						}
-					}
-				} else {
-					fetchedFromDb = registrationStatusService.getUnProcessedPackets(querySize, elapseTime,
-							reprocessCount, statusList, reprocessExcludeStageNames);
+
+						// Fetch unprocessed packets if needed
+						if (fetchedResumable < allocationSize) {
+							List<String> types = config.getProcesses().stream()
+									.map(type -> {
+										try {
+											return SyncTypeDto.valueOf(type).getValue();
+										} catch (IllegalArgumentException e) {
+											LOGGER.error("Invalid process type: {}", type);
+											return null;
+										}
+									})
+									.filter(Objects::nonNull)
+									.collect(Collectors.toList());
+							List<String> statuses = config.getStatuses().isEmpty() ? statusList : config.getStatuses();
+
+							List<RegistrationStatusEntity> unprocessedEntities = registrationStatusService.getUnProcessedPacketsByType(
+									allocationSize - fetchedResumable, elapseTime, reprocessCount, statuses,
+									reprocessExcludeStageNames, types);
+
+							synchronized (seenRegistrationIds) {
+								result.addAll(unprocessedEntities.stream()
+										.filter(entity -> !seenRegistrationIds.contains(entity.getRegId()) &&
+												!cacheRegistrationIds.contains(entity.getRegId()))
+										.collect(Collectors.toList()));
+								seenRegistrationIds.addAll(result.stream()
+										.map(RegistrationStatusEntity::getRegId)
+										.collect(Collectors.toSet()));
+							}
+						}
+						promise.complete(result);
+					}, res -> {
+						if (res.succeeded()) {
+							future.complete((List<RegistrationStatusEntity>) res.result());
+						} else {
+							future.completeExceptionally(res.cause());
+						}
+					});
+					futures.add(future);
 				}
 
-				// Add to processing list up to remainingToFetch, cache the rest
-				for (InternalRegistrationStatusDto dto : fetchedFromDb) {
+				// Wait for all fetches to complete
+				CompletableFuture.allOf(futures.toArray(new CompletableFuture[0])).join();
+				for (CompletableFuture<List<RegistrationStatusEntity>> future : futures) {
+					fetchedFromDb.addAll(future.get());
+					totalFetched += future.get().size();
+				}
+
+				// Step 3: Fill the processing list and cache excess
+				for (RegistrationStatusEntity entity : fetchedFromDb) {
+					InternalRegistrationStatusDto dto = convertToDto(entity);
 					if (reprocessorDtoList.size() < fetchSize) {
 						reprocessorDtoList.add(dto);
 					} else {
-						packetCache.offer(dto); // Add excess to cache
+						packetCache.offer(dto); // Updates cacheRegistrationIds via overridden offer
+					}
+				}
+
+				// Step 4: If still short, fetch additional packets
+				if (totalFetched < remainingToFetch) {
+					CompletableFuture<List<RegistrationStatusEntity>> additionalFuture = new CompletableFuture<>();
+					int finalTotalFetched = totalFetched;
+					vertx.executeBlocking(promise -> {
+						List<RegistrationStatusEntity> additional = registrationStatusService.getUnProcessedPackets1(
+								remainingToFetch - finalTotalFetched, elapseTime, reprocessCount, statusList, reprocessExcludeStageNames);
+						synchronized (seenRegistrationIds) {
+							List<RegistrationStatusEntity> filtered = additional.stream()
+									.filter(entity -> !seenRegistrationIds.contains(entity.getRegId()) &&
+											!cacheRegistrationIds.contains(entity.getRegId()))
+									.collect(Collectors.toList());
+							seenRegistrationIds.addAll(filtered.stream()
+									.map(RegistrationStatusEntity::getRegId)
+									.collect(Collectors.toSet()));
+							promise.complete(filtered);
+						}
+					}, res -> {
+						if (res.succeeded()) {
+							additionalFuture.complete((List<RegistrationStatusEntity>) res.result());
+						} else {
+							additionalFuture.completeExceptionally(res.cause());
+						}
+					});
+
+					List<RegistrationStatusEntity> additional = additionalFuture.get();
+					for (RegistrationStatusEntity entity : additional) {
+						InternalRegistrationStatusDto dto = convertToDto(entity);
+						if (reprocessorDtoList.size() < fetchSize) {
+							reprocessorDtoList.add(dto);
+						} else {
+							packetCache.offer(dto);
+						}
 					}
 				}
 			}
 
-			// Step 3: Process the collected list
+			// Step 5: Process the collected list
 			if (!CollectionUtils.isEmpty(reprocessorDtoList)) {
-				reprocessorDtoList.forEach(dto -> {
+				List<InternalRegistrationStatusDto> batch = new ArrayList<>();
+				for (InternalRegistrationStatusDto dto : reprocessorDtoList) {
 					String registrationId = dto.getRegistrationId();
 					ridSb.append(registrationId).append(",");
 					MessageDTO messageDTO = new MessageDTO();
@@ -370,7 +568,6 @@ public class ReprocessorVerticle extends MosipVerticleAPIManager {
 						description.setCode(PlatformSuccessMessages.RPR_RE_PROCESS_FAILED.getCode());
 					} else {
 						messageDTO.setIsValid(true);
-						isTransactionSuccessful = true;
 						String stageName;
 						if (isRestartFromStageRequired(dto, reprocessRestartTriggerMap)) {
 							stageName = MessageBusUtil.getMessageBusAdress(reprocessRestartFromStage).concat(ReprocessorConstants.BUS_IN);
@@ -397,19 +594,39 @@ public class ReprocessorVerticle extends MosipVerticleAPIManager {
 					LOGGER.info(LoggerFileConstant.SESSIONID.toString(),
 							LoggerFileConstant.REGISTRATIONID.toString(), registrationId, description.getMessage());
 
-					String moduleId = PlatformSuccessMessages.RPR_SENT_TO_REPROCESS_SUCCESS.getCode();
-					String moduleName = ModuleName.RE_PROCESSOR.toString();
-					registrationStatusService.updateRegistrationStatusForWorkflowEngine(dto, moduleId, moduleName);
-
-					String eventId = EventId.RPR_402.toString();
-					String eventName = EventName.UPDATE.toString();
-					String eventType = EventType.BUSINESS.toString();
-
-					if (!isTransactionSuccessful) {
-						auditLogRequestBuilder.createAuditRequestBuilder(description.getMessage(), eventId, eventName,
-								eventType, moduleId, moduleName, registrationId);
+					batch.add(dto);
+					if (batch.size() >= 50) { // Configurable batch size
+						final List<InternalRegistrationStatusDto> batchToUpdate = new ArrayList<>(batch);
+						vertx.executeBlocking(promise -> {
+							registrationStatusService.updateRegistrationStatusForWorkflowEngineBatch(batchToUpdate,
+									PlatformSuccessMessages.RPR_SENT_TO_REPROCESS_SUCCESS.getCode(), ModuleName.RE_PROCESSOR.toString());
+							promise.complete();
+						}, res -> {
+							if (res.failed()) {
+								LOGGER.error("Failed to update batch for {}: {}", registrationId, res.cause().getMessage());
+								isTransactionSuccessful = false;
+							}
+						});
+						batch.clear();
 					}
-				});
+				}
+
+				// Update remaining batch
+				if (!batch.isEmpty()) {
+					vertx.executeBlocking(promise -> {
+						registrationStatusService.updateRegistrationStatusForWorkflowEngineBatch(batch,
+								PlatformSuccessMessages.RPR_SENT_TO_REPROCESS_SUCCESS.getCode(), ModuleName.RE_PROCESSOR.toString());
+						promise.complete();
+					}, res -> {
+						if (res.failed()) {
+							LOGGER.error("Failed to update batch: {}", res.cause().getMessage());
+							isTransactionSuccessful = false;
+						}
+					});
+				}
+			} else {
+				description.setMessage("No packets available for reprocessing");
+				description.setCode(PlatformSuccessMessages.RPR_RE_PROCESS_SUCCESS.getCode());
 			}
 		} catch (TablenotAccessibleException e) {
 			isTransactionSuccessful = false;
@@ -457,14 +674,17 @@ public class ReprocessorVerticle extends MosipVerticleAPIManager {
 			String[] stageAndStatus = filter.split(":");
 			String stageName = stageAndStatus[0];
 			String latestTransactionStatusCode = stageAndStatus[1];
-
-			Set<String> latestTransactionStatusCodeSet = reprocessRestartTriggerMap.computeIfAbsent(stageName, k -> new HashSet<>());
-			if (latestTransactionStatusCode.equalsIgnoreCase("*")) {
-				latestTransactionStatusCodeSet.add(RegistrationTransactionStatusCode.SUCCESS.toString());
-				latestTransactionStatusCodeSet.add(RegistrationTransactionStatusCode.IN_PROGRESS.toString());
-				latestTransactionStatusCodeSet.add(RegistrationTransactionStatusCode.REPROCESS.toString());
+			Set<String> latestTransactionStatusCodeSet;
+			if (reprocessRestartTriggerMap.containsKey(stageName)) {
+				latestTransactionStatusCodeSet = reprocessRestartTriggerMap.get(stageName);
+				if (latestTransactionStatusCodeSet.size() != 3) {
+					setReprocessRestartTriggerMap(reprocessRestartTriggerMap, stageName, latestTransactionStatusCode,
+							latestTransactionStatusCodeSet);
+				}
 			} else {
-				latestTransactionStatusCodeSet.add(latestTransactionStatusCode.toUpperCase());
+				latestTransactionStatusCodeSet = new HashSet<String>();
+				setReprocessRestartTriggerMap(reprocessRestartTriggerMap, stageName, latestTransactionStatusCode,
+						latestTransactionStatusCodeSet);
 			}
 		}
 		return reprocessRestartTriggerMap;
@@ -521,5 +741,39 @@ public class ReprocessorVerticle extends MosipVerticleAPIManager {
 	@Override
 	protected String getPropertyPrefix() {
 		return VERTICLE_PROPERTY_PREFIX;
+	}
+
+	private InternalRegistrationStatusDto convertToDto(RegistrationStatusEntity entity) {
+		InternalRegistrationStatusDto registrationStatusDto = new InternalRegistrationStatusDto();
+		registrationStatusDto.setRegistrationId(entity.getRegId());
+		registrationStatusDto.setRegistrationType(entity.getRegistrationType());
+		registrationStatusDto.setReferenceRegistrationId(entity.getReferenceRegistrationId());
+		registrationStatusDto.setStatusCode(entity.getStatusCode());
+		registrationStatusDto.setLangCode(entity.getLangCode());
+		registrationStatusDto.setStatusComment(entity.getStatusComment());
+		registrationStatusDto.setLatestRegistrationTransactionId(entity.getLatestRegistrationTransactionId());
+		registrationStatusDto.setIsActive(entity.isActive());
+		registrationStatusDto.setCreatedBy(entity.getCreatedBy());
+		registrationStatusDto.setCreateDateTime(entity.getCreateDateTime());
+		registrationStatusDto.setUpdatedBy(entity.getUpdatedBy());
+		registrationStatusDto.setUpdateDateTime(entity.getUpdateDateTime());
+		registrationStatusDto.setIsDeleted(entity.isDeleted());
+		registrationStatusDto.setDeletedDateTime(entity.getDeletedDateTime());
+		registrationStatusDto.setRetryCount(entity.getRetryCount());
+		registrationStatusDto.setApplicantType(entity.getApplicantType());
+		registrationStatusDto.setReProcessRetryCount(entity.getRegProcessRetryCount());
+		registrationStatusDto.setLatestTransactionStatusCode(entity.getLatestTransactionStatusCode());
+		registrationStatusDto.setLatestTransactionTypeCode(entity.getLatestTransactionTypeCode());
+		registrationStatusDto.setRegistrationStageName(entity.getRegistrationStageName());
+		registrationStatusDto.setUpdateDateTime(entity.getUpdateDateTime());
+		registrationStatusDto.setResumeTimeStamp(entity.getResumeTimeStamp());
+		registrationStatusDto.setDefaultResumeAction(entity.getDefaultResumeAction());
+		registrationStatusDto.setPauseRuleIds(entity.getPauseRuleIds());
+		registrationStatusDto.setLastSuccessStageName(entity.getLastSuccessStageName());
+		registrationStatusDto.setSource(entity.getSource());
+		registrationStatusDto.setIteration(entity.getIteration());
+		registrationStatusDto.setWorkflowInstanceId(entity.getId().getWorkflowInstanceId());
+		registrationStatusDto.setPacketCreateDateTime(entity.getPacketCreatedDateTime());
+		return registrationStatusDto;
 	}
 }

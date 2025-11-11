@@ -244,4 +244,20 @@ public class RegistrationStatusDao {
 
 		return registrationStatusRepositary.getResumablePackets(RegistrationStatusCode.RESUMABLE.toString(), fetchSize);
 	}
+
+	public List<RegistrationStatusEntity> getUnProcessedPacketsByType(
+			Integer fetchSize, long elapseTime, Integer reprocessCount,
+			List<String> status, List<String> excludeStageNames, List<String> registrationTypes) {
+		LocalDateTime timeDifference = LocalDateTime.now().minusSeconds(elapseTime);
+		List<String> statusCodes = new ArrayList<>();
+		statusCodes.add(RegistrationStatusCode.PAUSED.toString());
+		statusCodes.add(RegistrationStatusCode.RESUMABLE.toString());
+		statusCodes.add(RegistrationStatusCode.PAUSED_FOR_ADDITIONAL_INFO.toString());
+		statusCodes.add(RegistrationStatusCode.REJECTED.toString());
+		statusCodes.add(RegistrationStatusCode.FAILED.toString());
+		statusCodes.add(RegistrationStatusCode.PROCESSED.toString());
+
+		return registrationStatusRepositary.getUnProcessedPacketsByType(
+				status, reprocessCount, timeDifference, statusCodes, fetchSize, excludeStageNames, registrationTypes);
+	}
 }

@@ -566,7 +566,7 @@ public class RegistrationStatusServiceTest {
 		registrationStatusEntity.setStatusCode("PAUSED");
 		Mockito.when(registrationStatusDao.getResumablePackets(anyInt()))
 				.thenReturn(List.of(registrationStatusEntity));
-		List<InternalRegistrationStatusDto> dtolist = registrationStatusService.getResumablePackets(1);
+		List<InternalRegistrationStatusDto> dtolist = registrationStatusService.getResumablePacketsOld(1);
 		assertEquals("PAUSED", dtolist.get(0).getStatusCode());
 	}
 
